@@ -741,6 +741,11 @@ _SUMMARY_WINDOW_HEADROOM_RATIO = 0.20
 def _summarizer_max_output_tokens(compressor: Any) -> Optional[int]:
     """The summarizer model's own output cap, or None when it cannot be determined.
 
+    The summary call resolves its route from ``auxiliary.compression`` (see
+    :meth:`ContextCompressor._generate_summary`), NOT from the compressor's main model, so that
+    route is queried first; the compressor's own provider/model pair is only a fallback. Querying
+    the main model here would clamp the summary budget with an unrelated model's cap.
+
     Best-effort and never fatal: the models.dev catalog may not index a gateway/relay route
     (e.g. a local new-api base_url), in which case the budget simply falls back to the
     configured ceiling and the window headroom.
@@ -749,12 +754,24 @@ def _summarizer_max_output_tokens(compressor: Any) -> Optional[int]:
         from agent.models_dev import get_model_capabilities
     except Exception:
         return None
-    provider = str(getattr(compressor, "summary_provider", None) or getattr(compressor, "provider", None) or "")
+    candidates: List[tuple] = []
+    try:
+        from agent.auxiliary_client import _get_auxiliary_task_config
+
+        route = _get_auxiliary_task_config("compression") or {}
+        route_provider = str(route.get("provider") or "")
+        route_model = str(route.get("model") or "")
+        if route_provider and route_model:
+            candidates.append((route_provider, route_model))
+    except Exception:
+        pass
+    provider = str(getattr(compressor, "provider", None) or "")
     for name in (getattr(compressor, "summary_model", None), getattr(compressor, "model", None)):
-        if not name:
-            continue
+        if name:
+            candidates.append((provider, str(name)))
+    for prov, name in candidates:
         try:
-            caps = get_model_capabilities(provider, str(name))
+            caps = get_model_capabilities(prov, name)
         except Exception:
             continue
         cap = getattr(caps, "max_output_tokens", None) if caps is not None else None
@@ -3888,18 +3905,23 @@ Write only the summary body. Do not include any preamble or prefix."""
         # Truncation (finish_reason=length) is DETERMINISTIC for an unchanged route AND budget: the
         # old route spends the same budget and truncates again, so retrying on the main model alone
         # cannot help, and going straight to a cooldown just re-issues the same capped request. Give
-        # it exactly ONE retry that raises the output budget first (the configured ceiling, itself
-        # clamped by the model's cap and the window headroom). The latch is per compression cycle,
-        # so there is no unbounded retry.
+        # it exactly ONE retry, and only when that retry can actually carry a LARGER output budget
+        # (the configured ceiling, itself clamped by the model's cap and the window headroom). The
+        # latch is per compression cycle, so there is no unbounded retry.
         if kind.truncated and not getattr(self, "_truncated_retry_done", False):
-            self._truncated_retry_done = True
             raised = self._raise_summary_budget_for_retry()
-            logger.warning(
-                "Context compression summary truncated (finish_reason=length); retrying once with a "
-                "larger output budget: %s -> %s tokens.",
-                raised[0], raised[1],
-            )
-            return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)
+            if raised[1] > raised[0]:
+                self._truncated_retry_done = True
+                logger.warning(
+                    "Context compression summary truncated (finish_reason=length); retrying once with a "
+                    "larger output budget: %s -> %s tokens.",
+                    raised[0], raised[1],
+                )
+                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)
+            # Nothing left to raise: the budget already sits at the ceiling the route and the window
+            # allow, so an identical re-issue would truncate identically — one wasted LLM call per
+            # turn. Fall through to the existing cooldown/abort ladder instead.
+            self._truncated_retry_done = True
 
         # Transient errors: short cooldown for JSON-decode/streaming-closed/empty-content. Timeouts escalate
         # 60s→300s→900s (structural repeat offenders) and take precedence over the short rung; truncation

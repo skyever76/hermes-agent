@@ -41,6 +41,12 @@ def _compressor(**attrs):
     return c
 
 
+@pytest.fixture(autouse=True)
+def _isolate_host_aux_route(monkeypatch):
+    """Keep the budget assertions independent of the host's live `auxiliary.compression` route."""
+    monkeypatch.setattr("agent.auxiliary_client._get_auxiliary_task_config", lambda _task: {})
+
+
 # --- a. backward compatibility -----------------------------------------------------------------
 
 
@@ -128,6 +134,33 @@ def test_model_output_cap_wins_when_smaller(monkeypatch):
     monkeypatch.setattr(mod, "_summarizer_max_output_tokens", lambda _c: 8_000, raising=True)
     c = _compressor(summary_tokens_ceiling=32_000)
     assert c.max_summary_tokens == 8_000
+
+
+def test_summarizer_cap_is_read_from_the_aux_compression_route(monkeypatch):
+    """h. The model-output limb queries the AUX summariser route, never the main model's route.
+
+    The summary call resolves provider/model from `auxiliary.compression`; reading the main
+    model's catalog cap here would clamp the summary budget with an unrelated model.
+    """
+    import agent.context_compressor as mod
+
+    class _Caps:
+        max_output_tokens = 8_000
+
+    seen = {}
+
+    def _fake(provider, model):
+        seen["route"] = (provider, model)
+        return _Caps()
+
+    monkeypatch.setattr(
+        "agent.auxiliary_client._get_auxiliary_task_config",
+        lambda _task: {"provider": "deepseek", "model": "deepseek-flash"},
+    )
+    monkeypatch.setattr(mod, "get_model_capabilities", _fake)
+    c = _compressor(summary_tokens_ceiling=32_000, provider="newapi", model="main-model")
+    assert c.max_summary_tokens == 8_000
+    assert seen["route"] == ("deepseek", "deepseek-flash")
 
 
 # --- d/e. truncation retry ----------------------------------------------------------------------
