@@ -840,6 +840,19 @@ def resolve_compression_fallback_route() -> Optional[dict]:
         except Exception:
             logger.debug("compression fallback_chain[%d] api key resolution failed", index, exc_info=True)
             api_key = None
+        # Do not send a large summary budget to a route that cannot emit it: a route whose catalog
+        # max output is below the budget will truncate with finish_reason=length no matter what we
+        # ask for, which is exactly the failure this chain exists to escape. Unknown/unindexed
+        # routes (gateways, relays) are allowed through — the budget is clamped elsewhere.
+        required = _compression_summary_budget_hint()
+        if required:
+            cap = _route_max_output_tokens(provider, model)
+            if cap is not None and cap < required:
+                logger.warning(
+                    "Skipping compression fallback_chain[%d] (%s/%s): max output %d < summary budget %d.",
+                    index, provider, model, cap, required,
+                )
+                continue
         from agent.auxiliary_client import _coerce_positive_timeout
         timeout = _coerce_positive_timeout(entry.get("timeout"))
         return {
@@ -851,6 +864,36 @@ def resolve_compression_fallback_route() -> Optional[dict]:
             "api_mode": str(entry.get("api_mode") or entry.get("transport") or "").strip() or None,
             "timeout": timeout,
         }
+    return None
+
+
+def _compression_summary_budget_hint() -> int:
+    """Configured ``compression.summary_tokens_ceiling`` (clamped), 0 when unreadable.
+
+    Read from config rather than a live compressor so the chain can be validated before any
+    compressor exists (startup wiring). Best-effort: wiring must never fail on it.
+    """
+    try:
+        from hermes_cli.config import load_config  # type: ignore
+        cfg = load_config() or {}
+        section = cfg.get("compression") if isinstance(cfg, dict) else None
+        raw = section.get("summary_tokens_ceiling") if isinstance(section, dict) else None
+        value = int(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) else 10_000
+        return max(4_000, min(value, 32_000))
+    except Exception:
+        return 0
+
+
+def _route_max_output_tokens(provider: str, model: str) -> Optional[int]:
+    """Catalog max output for one route, or None when the catalog does not index it."""
+    try:
+        from agent.models_dev import get_model_capabilities
+        caps = get_model_capabilities(provider, model)
+        cap = getattr(caps, "max_output_tokens", None) if caps is not None else None
+        if isinstance(cap, (int, float)) and not isinstance(cap, bool) and cap > 0:
+            return int(cap)
+    except Exception:
+        logger.debug("max output lookup failed for %s/%s", provider, model, exc_info=True)
     return None
 
 

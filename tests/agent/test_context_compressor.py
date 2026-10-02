@@ -2146,10 +2146,14 @@ class TestUpdateModelBudgets:
         old_tail = comp.tail_token_budget
         old_max_summary = comp.max_summary_tokens
 
-        comp.update_model("model-b", context_length=32_000)
+        comp.update_model("model-b", context_length=8_000)
         assert comp.tail_token_budget != old_tail, "tail_token_budget should change"
         assert comp.tail_token_budget < old_tail, "smaller context → smaller budget"
-        assert comp.max_summary_tokens != old_max_summary, "max_summary_tokens should change"
+        # The summary budget is recomputed from the NEW window (it is no longer a flat
+        # min(window*0.05, ceiling)): for an 8K window the headroom term (80% of the window)
+        # is below the 10K ceiling, so it decides the budget.
+        assert comp.max_summary_tokens == 6_400, "max_summary_tokens should change"
+        assert comp.max_summary_tokens != old_max_summary
 
     def test_budgets_proportional(self):
         """Budgets should be proportional to context_length after update."""
@@ -2160,7 +2164,9 @@ class TestUpdateModelBudgets:
             )
         comp.update_model("model-b", context_length=10_000)
         assert comp.tail_token_budget == int(comp.threshold_tokens * comp.summary_target_ratio)
-        assert comp.max_summary_tokens == min(int(10_000 * 0.05), 4000)
+        # min(configured ceiling 10_000, window headroom 80% of 10_000) — the legacy
+        # `int(context_length * 0.05)` term was removed (it pinned a 1M window to the ceiling).
+        assert comp.max_summary_tokens == 8_000
 
     def test_default_mode_is_lean(self):
         """#tail-default-flip: an unconfigured compressor uses the lean tail.

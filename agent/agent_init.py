@@ -361,7 +361,14 @@ def _cfg_dict(cfg: Dict[str, Any], key: str) -> Dict[str, Any]:
 
 
 class CompressionSettings(SimpleNamespace):
-    """Parsed ``compression`` config section (see ``_parse_compression_config``)."""
+    """Parsed ``compression`` config section (see ``_parse_compression_config``).
+
+    ``summary_tokens_ceiling`` — absolute cap on the compression summary's output budget.
+    Defaults to 10_000 (prior behaviour). Out-of-range config values are clamped to
+    4_000–32_000 so a bad value can never make compaction fatal.
+    """
+
+    summary_tokens_ceiling: int = 10_000
 
 
 _EXPLICIT_API_MODES = {
@@ -1474,6 +1481,13 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
     threshold_tokens = cfg.get("threshold_tokens")
     if threshold_tokens is not None:
         threshold_tokens = _positive_int(threshold_tokens)
+    # summary_tokens_ceiling: absolute cap on the summary's output budget. Clamped to
+    # 4_000–32_000 so a bad value degrades to a bounded budget instead of being fatal.
+    # 10_000 default reproduces prior behaviour exactly.
+    summary_tokens_ceiling = _parse_config_int(
+        cfg.get("summary_tokens_ceiling", 10_000), 10_000
+    )
+    summary_tokens_ceiling = max(4_000, min(summary_tokens_ceiling, 32_000))
     # Non-system head messages to protect (system prompt is always protected); 0 is a
     # legitimate "system prompt + summary + tail".
     protect_first = max(0, int(cfg.get("protect_first_n", 3)))
@@ -1514,6 +1528,7 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
             if isinstance(v, (int, float)) and not isinstance(v, bool)
         },
         threshold_tokens=threshold_tokens,
+        summary_tokens_ceiling=summary_tokens_ceiling,
         checkpoint_required=checkpoint_required,
         # In-place compaction: no session-id rotation. default=True MUST match DEFAULT_CONFIG
         # (a False default flipped agents into rotation mode when the key was omitted).
