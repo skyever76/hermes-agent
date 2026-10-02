@@ -115,11 +115,22 @@ def test_tiny_window_never_produces_unusable_budget():
 
 def test_unknown_route_is_not_fatal(monkeypatch):
     """h. When the catalog cannot resolve the model, the lookup returns None (budget still works)."""
-    import agent.context_compressor as mod
-
-    monkeypatch.setattr(mod, "get_model_capabilities", None, raising=False)
+    monkeypatch.setattr("agent.models_dev.get_model_capabilities", lambda _p, _m: None)
     c = _compressor(summary_tokens_ceiling=32_000)
     c.summary_model = "not-in-catalog"
+    assert _summarizer_max_output_tokens(c) is None
+    assert c.max_summary_tokens == 32_000
+
+
+def test_lookup_survives_a_broken_catalog(monkeypatch):
+    """h. A catalog that raises must not propagate: the budget falls back to ceiling/headroom."""
+
+    def _boom(_p, _m):
+        raise RuntimeError("catalog unavailable")
+
+    monkeypatch.setattr("agent.models_dev.get_model_capabilities", _boom)
+    c = _compressor(summary_tokens_ceiling=32_000)
+    c.summary_model = "whatever"
     assert _summarizer_max_output_tokens(c) is None
     assert c.max_summary_tokens == 32_000
 
@@ -157,7 +168,7 @@ def test_summarizer_cap_is_read_from_the_aux_compression_route(monkeypatch):
         "agent.auxiliary_client._get_auxiliary_task_config",
         lambda _task: {"provider": "deepseek", "model": "deepseek-flash"},
     )
-    monkeypatch.setattr(mod, "get_model_capabilities", _fake)
+    monkeypatch.setattr("agent.models_dev.get_model_capabilities", _fake)
     c = _compressor(summary_tokens_ceiling=32_000, provider="newapi", model="main-model")
     assert c.max_summary_tokens == 8_000
     assert seen["route"] == ("deepseek", "deepseek-flash")
