@@ -559,6 +559,14 @@ DEFAULT_CONFIG = {
         # models (their 50% trigger sat at 500K, so compaction never fired) while every lower
         # ratio trigger still wins; null = ratio-only.
         "threshold_tokens": 256_000,
+        # summary_tokens_ceiling: absolute cap on the COMPRESSION SUMMARY's output budget.
+        # Global default 10_000 preserves prior behaviour exactly; raise it (e.g. 32_000) when the
+        # summarizer truncates with finish_reason=length on long histories — a truncated summary
+        # aborts compaction, so the session keeps growing until it is fixed. Valid range 4_000–32_000;
+        # out-of-range values are clamped (never fatal). The effective budget is the MINIMUM of this
+        # ceiling, the summarizer model's own max output, and the window headroom kept for input and
+        # tool schema — configuring 32_000 does not by itself guarantee a 32_000 budget.
+        "summary_tokens_ceiling": 10_000,
         # "progress_notices": False,    # opt-in (#52995): when True, routine compression
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         # tail_mode: "lean" = clamped 2.5%-of-window tail (10K floor / 25K cap) plus chunked

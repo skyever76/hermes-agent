@@ -724,7 +724,43 @@ def _next_timeout_cooldown(compressor: Any, counter: str = "_consecutive_timeout
 _MIN_SUMMARY_TOKENS = 2000
 _SUMMARY_RATIO = 0.20
 # Summaries above ~10K tokens are themselves a context-pressure source.
+# This stays the DEFAULT ceiling (unchanged behaviour); it can be raised per profile via
+# `compression.summary_tokens_ceiling` (see CompressionSettings.summary_tokens_ceiling).
 _SUMMARY_TOKENS_CEILING = 10_000
+# Documented band for the configurable ceiling (see config_defaults `summary_tokens_ceiling`).
+_SUMMARY_TOKENS_CEILING_MIN = 4_000
+# Hard upper bound for the configurable ceiling — keeps a mistyped value from requesting an
+# output budget no summarizer route can serve.
+_SUMMARY_TOKENS_CEILING_MAX = 32_000
+# Fraction of the summarizer window kept OUT of the output budget: room for the input history
+# plus tool schema. The effective budget is the MINIMUM of (configured ceiling, model max
+# output, window headroom) so a large ceiling never over-commits the window.
+_SUMMARY_WINDOW_HEADROOM_RATIO = 0.20
+
+
+def _summarizer_max_output_tokens(compressor: Any) -> Optional[int]:
+    """The summarizer model's own output cap, or None when it cannot be determined.
+
+    Best-effort and never fatal: the models.dev catalog may not index a gateway/relay route
+    (e.g. a local new-api base_url), in which case the budget simply falls back to the
+    configured ceiling and the window headroom.
+    """
+    try:
+        from agent.models_dev import get_model_capabilities
+    except Exception:
+        return None
+    provider = str(getattr(compressor, "summary_provider", None) or getattr(compressor, "provider", None) or "")
+    for name in (getattr(compressor, "summary_model", None), getattr(compressor, "model", None)):
+        if not name:
+            continue
+        try:
+            caps = get_model_capabilities(provider, str(name))
+        except Exception:
+            continue
+        cap = getattr(caps, "max_output_tokens", None) if caps is not None else None
+        if isinstance(cap, (int, float)) and not isinstance(cap, bool) and cap > 0:
+            return int(cap)
+    return None
 
 # After this many failures at one cursor, skip the exchange to avoid busy-looping.
 _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES = 3
@@ -2068,8 +2104,33 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
 
     @property
     def max_summary_tokens(self) -> int:
+        """Output budget for one compression summary — the MINIMUM of three safe limits.
+
+        1. the configured ceiling (``compression.summary_tokens_ceiling``, 4_000–32_000),
+        2. the summarizer model's own max output, when the catalog knows it,
+        3. the summarizer window headroom (window minus ``_SUMMARY_WINDOW_HEADROOM_RATIO``).
+
+        Historically this was ``min(context_length * 0.05, 10_000)``: on a 1M window the ratio
+        term was 50_000 and the flat ceiling won, so raising the ceiling alone would still be
+        capped. The ratio term is therefore *replaced* by the headroom term, and the result is
+        floored at ``_MIN_SUMMARY_TOKENS`` so a tiny window cannot produce an unusable budget.
+        """
         if self._max_summary_tokens is None:
-            self._max_summary_tokens = min(int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING)
+            ceiling = getattr(self, "summary_tokens_ceiling", None)
+            ceiling = int(ceiling) if isinstance(ceiling, (int, float)) and not isinstance(ceiling, bool) else _SUMMARY_TOKENS_CEILING
+            # Clamp the *configured* ceiling to the documented 4_000–32_000 band. 4_000 (not
+            # _MIN_SUMMARY_TOKENS) is the floor here: a configured value below it is a misconfig and
+            # must land on the band floor, whereas _MIN_SUMMARY_TOKENS only guards the final result
+            # against a tiny window.
+            ceiling = max(_SUMMARY_TOKENS_CEILING_MIN, min(ceiling, _SUMMARY_TOKENS_CEILING_MAX))
+            candidates = [ceiling]
+            model_out = _summarizer_max_output_tokens(self)
+            if model_out:
+                candidates.append(int(model_out))
+            window = _safe_int(self.context_length)
+            if window:
+                candidates.append(int(window * (1.0 - _SUMMARY_WINDOW_HEADROOM_RATIO)))
+            self._max_summary_tokens = max(_MIN_SUMMARY_TOKENS, min(candidates))
         return self._max_summary_tokens
 
     @max_summary_tokens.setter
@@ -2460,7 +2521,10 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # Reset to None so the property recomputes via the mode-aware path (not the legacy formula).
         self._tail_token_budget = None
         _ = self.tail_token_budget  # eager recompute, same timing as before
-        self.max_summary_tokens = min(int(context_length * 0.05), _SUMMARY_TOKENS_CEILING)
+        # Same reset for the summary budget: let the property recompute it from the *new* model's
+        # window, output cap and the configured ceiling — the legacy `context_length * 0.05` term
+        # is gone (it was capped flat at 10K on 1M-window models).
+        self._max_summary_tokens = None
         # Old usage cannot price a new model. Clear it without arming the post-compaction
         # latch: the next response supplies usage or enables the usage-less fallback.
         self.last_prompt_tokens = self.last_completion_tokens = self.last_total_tokens = 0
@@ -3470,6 +3534,29 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             prev_end = end
         return "".join(parts)
 
+    def _raise_summary_budget_for_retry(self) -> tuple:
+        """Raise the summary output budget to the configured ceiling for the ONE truncation retry.
+
+        Returns ``(before, after)`` for the log line. The ceiling itself is re-clamped here by the
+        same three limits the property uses, so a retry can never ask for more than the model or the
+        window can serve. Returns an unchanged pair when there is nothing left to raise.
+        """
+        before = int(self.max_summary_tokens)
+        ceiling = getattr(self, "summary_tokens_ceiling", None)
+        ceiling = int(ceiling) if isinstance(ceiling, (int, float)) and not isinstance(ceiling, bool) else before
+        candidates = [max(_SUMMARY_TOKENS_CEILING_MIN, min(ceiling, _SUMMARY_TOKENS_CEILING_MAX))]
+        model_out = _summarizer_max_output_tokens(self)
+        if model_out:
+            candidates.append(int(model_out))
+        window = _safe_int(self.context_length)
+        if window:
+            candidates.append(int(window * (1.0 - _SUMMARY_WINDOW_HEADROOM_RATIO)))
+        after = max(_MIN_SUMMARY_TOKENS, min(candidates))
+        if after > before:
+            self._max_summary_tokens = after
+            return (before, after)
+        return (before, before)
+
     def _fallback_to_main_for_compression(self, e: Exception, reason: str) -> None:
         """Fall back from a separate ``summary_model`` to the main model: record the aux failure, clear model + cooldown."""
         self._summary_model_fallen_back = True
@@ -3617,6 +3704,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             self._previous_summary = summary
             self._clear_compression_failure_cooldown()
             self._summary_model_fallen_back = False
+            self._truncated_retry_done = False
             self._last_summary_error = None
             for flag, _class, _msg in _TERMINAL_SUMMARY_FAILURES:
                 setattr(self, flag, False)
@@ -3795,6 +3883,22 @@ Write only the summary body. Do not include any preamble or prefix."""
         if self.summary_model and self.summary_model != self.model and not getattr(self, "_summary_model_fallen_back", False):
             self._fallback_to_main_for_compression(e, kind.fallback_reason())
             # Retry immediately on the main model.
+            return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)
+
+        # Truncation (finish_reason=length) is DETERMINISTIC for an unchanged route AND budget: the
+        # old route spends the same budget and truncates again, so retrying on the main model alone
+        # cannot help, and going straight to a cooldown just re-issues the same capped request. Give
+        # it exactly ONE retry that raises the output budget first (the configured ceiling, itself
+        # clamped by the model's cap and the window headroom). The latch is per compression cycle,
+        # so there is no unbounded retry.
+        if kind.truncated and not getattr(self, "_truncated_retry_done", False):
+            self._truncated_retry_done = True
+            raised = self._raise_summary_budget_for_retry()
+            logger.warning(
+                "Context compression summary truncated (finish_reason=length); retrying once with a "
+                "larger output budget: %s -> %s tokens.",
+                raised[0], raised[1],
+            )
             return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)
 
         # Transient errors: short cooldown for JSON-decode/streaming-closed/empty-content. Timeouts escalate
@@ -4996,6 +5100,9 @@ Write only the summary body. Do not include any preamble or prefix."""
         the caller's attempt budget.
         """
         telemetry = self._begin_compress_attempt(current_tokens, force)
+        # One truncation retry per compression cycle: reset the latch as the cycle opens so a later
+        # retry (which re-enters _generate_summary, NOT compress) cannot clear its own guard.
+        self._truncated_retry_done = False
         n_messages = len(messages)
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self._protect_head_size(messages) + 3 + 1
